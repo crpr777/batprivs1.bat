@@ -1,0 +1,201 @@
+@echo off
+:: ============================================================
+:: batprivs.bat - Pure batch local privilege escalation checker
+:: Works on Windows 7–11 / Server 2008–2025 - No PowerShell required
+:: Perfect for VDI, Citrix, AVD, locked-down workstations
+:: ============================================================
+
+setlocal enabledelayedexpansion
+title BATPrivs - Local Privilege Escalation Quick Check
+color 0b
+cls
+echo.
+echo  ██████╗  █████╗ ████████╗██████╗ ██████╗ ██╗██╗   ██╗███████╗
+echo  ██╔══██╗██╔══██╗╚══██╔══╝██╔══██╗██╔══██╗██║██║   ██║██╔════╝
+echo  ██████╔╝███████║   ██║   ██████╔╝██████╔╝██║██║   ██║███████╗
+echo  ██╔══██╗██╔══██║   ██║   ██╔═══╝ ██╔══██╗██║╚██╗ ██╔╝╚════██║
+echo  ██████╔╝██║  ██║   ██║   ██║     ██║  ██║██║ ╚████╔╝ ███████║
+echo  ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═══╝  ╚══════╝
+echo.
+echo  Pure-batch local priv-esc checker (no PowerShell needed)
+echo  Running as: %USERDOMAIN%\%USERNAME%
+echo  Computer: %COMPUTERNAME%  ^|  OS: %OS%  ^|  Arch: %PROCESSOR_ARCHITECTURE%
+echo  Started: %date% %time%
+echo.
+
+set "REPORT=%~dp0BATPrivs_Report_%COMPUTERNAME%_%date:~-4%%date:~4,2%%date:~7,2%_%time:~0,2%%time:~3,2%.txt"
+ >"%REPORT%"
+echo ================================================== >>"%REPORT%"
+echo BATPrivs Report - %COMPUTERNAME% - %date% %time% >>"%REPORT%"
+echo User: %USERDOMAIN%\%USERNAME% (%USERDNSDOMAIN%) >>"%REPORT%"
+echo ================================================== >>"%REPORT%"
+echo. >>"%REPORT%"
+
+:: =================================================================
+:: 1. Are we already admin or SYSTEM?
+:: =================================================================
+echo [1/11] Checking current privileges...
+whoami /groups | findstr /i "High Mandatory Level" >nul && (
+    echo [+] Already running with HIGH integrity (Administrator rights)
+    echo [+] CURRENT PRIVILEGE: HIGH INTEGRITY (Administrator) >>"%REPORT%"
+) || (
+    echo [-] Running with Medium integrity only
+    echo [-] CURRENT PRIVILEGE: Medium Integrity >>"%REPORT%"
+)
+
+net session >nul 2>&1
+if !errorlevel! == 0 (
+    echo [+] net session succeeded ^>^> You have LOCAL ADMIN rights RIGHT NOW
+    echo [+] LOCAL ADMIN RIGHTS: YES (net session works) >>"%REPORT%"
+) else (
+    echo [-] No local admin rights (net session failed)
+    echo [-] LOCAL ADMIN RIGHTS: NO >>"%REPORT%"
+)
+
+:: =================================================================
+:: 2. SeDebugPrivilege / SeImpersonate / SeAssignPrimaryToken / SeTakeOwnership / SeLoadDriver
+:: =================================================================
+echo.
+echo [2/11] Checking dangerous privileges (SeImpersonate, SeDebug, etc.)...
+whoami /priv | findstr /i "SeImpersonate SeAssignPrimaryToken SeDebug SeTakeOwnership SeLoadDriver SeBackup SeRestore" > "%TEMP%\privs.txt" 2>nul
+if %errorlevel% == 0 (
+    echo [+] DANGEROUS PRIVILEGES FOUND:
+    type "%TEMP%\privs.txt"
+    echo. >>"%REPORT%"
+    echo [+] DANGEROUS PRIVILEGES (Juicy Potato / PrintSpoofer / RogueWinRM candidates): >>"%REPORT%"
+    type "%TEMP%\privs.txt" >>"%REPORT%"
+) else (
+    echo [-] No juicy token privileges found
+    echo [-] No SeImpersonate/SeAssignPrimaryToken/etc. >>"%REPORT%"
+)
+
+:: =================================================================
+:: 3. Unquoted service paths
+:: =================================================================
+echo.
+echo [3/11] Checking for unquoted service paths...
+wmic service get name,pathname | findstr /i /v /c:"C:\Windows\\" | findstr /i /v """ > "%TEMP%\unquoted.txt" 2>nul
+if %errorlevel% == 0 (
+    echo [+] UNQUOTED SERVICE PATHS FOUND (potential hijack):
+    type "%TEMP%\unquoted.txt" | findstr /i /v "system32"
+    echo. >>"%REPORT%"
+    echo [+] UNQUOTED SERVICE PATHS (writeable by you ^> priv-esc): >>"%REPORT%"
+    type "%TEMP%\unquoted.txt" | findstr /i /v "system32" >>"%REPORT%"
+) else echo [-] No obvious unquoted paths
+
+:: =================================================================
+:: 4. Writeable service binaries / service folders
+:: =================================================================
+echo.
+echo [4/11] Checking if you can modify running service binaries...
+for /f "tokens=2 delims==" %%A in ('wmic service get name^,pathname ^| findstr /i /v "C:\Windows\\"') do (
+    for /f "delims=" %%B in ("%%A") do (
+        echo %%B | findstr /i "C:\\Program Files" >nul && (
+            icacls "%%B" 2>nul | findstr /i "(F) (M) (W) %USERNAME%" >nul && (
+                echo [+] WRITEABLE SERVICE BINARY: %%B
+                echo [+] WRITEABLE SERVICE: %%B >>"%REPORT%"
+            )
+        )
+    )
+)
+
+:: =================================================================
+:: 5. Weak service permissions (you can reconfigure/stop/start)
+:: =================================================================
+echo.
+echo [5/11] Checking weak service permissions...
+sc.exe query state=all | findstr SERVICE_NAME > "%TEMP%\svc.txt"
+for /f "tokens=2" %%S in (%TEMP%\svc.txt) do (
+    call :CheckServicePerms %%S
+)
+goto :AfterCheck
+
+:CheckServicePerms
+sc.exe sdshow %1 | findstr /i "%USERNAME%" >nul
+if !errorlevel! == 0 (
+    echo [+] YOU CAN MODIFY SERVICE: %1
+    echo [+] WEAK SERVICE PERMS: %1 >>"%REPORT%"
+)
+exit /b
+
+:AfterCheck
+
+:: =================================================================
+:: 6. AlwaysInstallElevated registry key (MSI from anywhere)
+:: =================================================================
+echo.
+echo [6/11] Checking AlwaysInstallElevated (MSI anywhere ^> SYSTEM)...
+reg query HKLM\SOFTWARE\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated >nul 2>&1
+if %errorlevel% == 0 (
+    reg query HKCU\SOFTWARE\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated >nul 2>&1
+    if %errorlevel% == 0 (
+        echo [+] ALWAYSINSTALLELEVATED = 1 (MSI files run as SYSTEM!)
+        echo [+] AlwaysInstallElevated enabled ^>^> msiexec.exe /quiet /i evil.msi >>"%REPORT%"
+    )
+)
+
+:: =================================================================
+:: 7. Hotfixes / Known exploits (PrintNightmare, PrintSpoofer, etc.)
+:: =================================================================
+echo.
+echo [7/11] Checking for missing critical hotfixes (quick check)...
+systeminfo | findstr /i "KB5004442 KB5005033 KB5005565 KB5006670 KB5007186" >nul || (
+    echo [?] Some PrintNightmare / recent priv-esc patches appear MISSING
+    echo [?] Missing recent patches (potential PrintSpoofer / etc.) >>"%REPORT%"
+)
+
+:: =================================================================
+:: 8. Interesting writable folders in PATH
+:: =================================================================
+echo.
+echo [8/11] Checking for writable directories in PATH...
+echo %PATH% > "%TEMP%\path.txt"
+for %%P in ("%PATH:;=" "%") do (
+    icacls "%%P" 2>nul | findstr /i "(F) (M) (W) %USERNAME%" >nul && (
+        echo [+] WRITABLE PATH DIRECTORY: %%P
+        echo [+] PATH Hijack possible: %%P >>"%REPORT%"
+    )
+)
+
+:: =================================================================
+:: 9. Scheduled tasks with weak permissions
+:: =================================================================
+echo.
+echo [9/11] Checking scheduled tasks running as SYSTEM with weak perms...
+schtasks /query /fo LIST 2>nul | findstr /i "SYSTEM.*Interactive" >nul && (
+    echo [+] Found scheduled task running as SYSTEM that allows interactive logon
+    echo [+] Potential schtask hijack >>"%REPORT%"
+)
+
+:: =================================================================
+:: 10. Stored credentials (cmdkey, vault, DPAPI)
+:: =================================================================
+echo.
+echo [10/11] Checking for stored credentials...
+cmdkey /list | findstr /i "target" > "%TEMP%\cmdkey.txt"
+if %errorlevel% == 0 (
+    echo [+] Saved credentials with cmdkey /list:
+    type "%TEMP%\cmdkey.txt"
+    echo [+] cmdkey /list saved credentials ^>^> runas /savecred >>"%REPORT%"
+)
+
+:: =================================================================
+:: 11. Final summary
+:: =================================================================
+echo.
+echo =================================================
+echo  SCAN COMPLETE - Summary written to:
+echo  %REPORT%
+echo =================================================
+echo.
+echo Quick wins to try right now if you found:
+echo   • SeImpersonate ^> PrintSpoofer.exe or RoguePotato
+echo   • Unquoted paths ^> drop evil.exe in the folder
+echo   • Writable service ^> replace binary + restart
+echo   • AlwaysInstallElevated ^> msiexec /i evil.msi
+echo   • Writable PATH ^> drop DLL or exe with high precedence
+echo.
+pause
+start notepad.exe "%REPORT%"
+endlocal
+exit /b
